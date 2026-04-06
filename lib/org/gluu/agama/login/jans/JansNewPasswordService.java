@@ -20,6 +20,12 @@ import java.util.Set;
 import java.util.HashSet;
 import java.util.stream.Collectors;
 
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
+import java.net.URI;
+import java.util.Base64;
+
 import com.twilio.Twilio;
 import com.twilio.rest.api.v2010.account.Message;
 import com.twilio.type.PhoneNumber;
@@ -150,9 +156,17 @@ public class JansNewPasswordService extends NewPasswordService {
 
             if (users != null && !users.isEmpty()) {
                 for (User u : users) {
-                    if (!u.getUserId().equalsIgnoreCase(username)) {
-                        logger.info("Phone {} is NOT unique. Already used by {}", phone, u.getUserId());
-                        return false; // duplicate
+                     if (u.getUserId().equalsIgnoreCase(username)) {
+                        continue;
+                    }
+
+                    User fullUser = userService.getUser(u.getUserId(), "uid", "jansStatus");
+                    String status = getSingleValuedAttr(fullUser, "jansStatus");
+                    logger.info("Found user {} with jansStatus {}", fullUser.getUserId(), status);
+
+                    if (status == null || "active".equalsIgnoreCase(status)) {
+                        logger.info("Phone {} already used by ACTIVE user {}", phone, u.getUserId());
+                        return false;
                     }
                 }
             }
@@ -164,7 +178,22 @@ public class JansNewPasswordService extends NewPasswordService {
             return false; // safest default on error
         }
     }
-
+    
+    private String getSingleValuedAttr(User user, String attribute) {
+        Object value = null;
+        if (attribute.equals("jansStatus")) {
+            value = user.getStatus() != null ? user.getStatus().getValue() : null;
+        } else {
+            value = user.getAttribute(attribute, true, false);
+        }
+        if (value == null) {
+            CustomObjectAttribute customAttr = userService.getCustomAttribute(user, attribute);
+            if (customAttr != null) {
+                value = customAttr.getValue();
+            }
+        }
+        return value == null ? null : value.toString();
+    }
 
     public String getPhoneNumber(String username) {
         try {
@@ -210,7 +239,9 @@ public class JansNewPasswordService extends NewPasswordService {
         return new String(otp);
     }
 
-    public boolean sendOTPCode(String username, String phone) {
+    //public boolean sendOTPCode(String username, String phone) {
+    public boolean sendOTPCode(String username, String phone, String verificationMethod) {
+
         try {
             // Get user preferred language from profile
             User user = userService.getUser(username);
@@ -242,6 +273,19 @@ public class JansNewPasswordService extends NewPasswordService {
             
             String message = messages.getOrDefault(lang, messages.get("en"));
 
+            return sendTwilioSms(phone, message, verificationMethod, otpCode, lang);
+
+        } catch (Exception ex) {
+            logger.error("Failed to send OTP to {}. Error: {}", phone, ex.getMessage(), ex);
+            return false;
+        }
+    }
+
+    //   private boolean sendTwilioSms(String phone, String message, String verificationMethod) {
+ 
+ /* Below method falls back to twilio sdk in the janssen. Can be reverted upon janssen confirmation of sdk upgrade
+    private boolean sendTwilioSms(String phone, String message, String verificationMethod, String otpCode, String lang) {
+        try {
             // Determine which FROM_NUMBER to use based on country code
             String fromNumber = getFromNumberForPhone(phone);
             
@@ -249,20 +293,136 @@ public class JansNewPasswordService extends NewPasswordService {
                 logger.error("FROM_NUMBER is null or empty, cannot send OTP to {}", phone);
                 return false;
             }
-
-            // Send SMS
+            boolean isWhatsApp = "whatsapp".equalsIgnoreCase(verificationMethod);
+            if (isWhatsApp) {
+                String whatsappFrom = flowConfig.get("FROM_NUMBER_WHATSAPP");
+            if (whatsappFrom != null && !whatsappFrom.trim().isEmpty()) {
+                fromNumber = whatsappFrom;
+                }
+            fromNumber = "whatsapp:" + fromNumber;
+            phone = "whatsapp:" + phone;
+            logger.info("Using WhatsApp channel for OTP delivery");
+                }
+                
             PhoneNumber FROM_NUMBER = new PhoneNumber(fromNumber);
+
+            logger.info("Sending from: {}", fromNumber);
+
             PhoneNumber TO_NUMBER = new PhoneNumber(phone);
 
-            Twilio.init(flowConfig.get("ACCOUNT_SID"), flowConfig.get("AUTH_TOKEN"));
-            Message.creator(TO_NUMBER, FROM_NUMBER, message).create();
+            logger.info("Sending to: {}", phone);
 
-            logger.info("OTP sent to {} using sender {}", phone, fromNumber);
+            Twilio.init(flowConfig.get("ACCOUNT_SID"), flowConfig.get("AUTH_TOKEN"));
+
+           // Message.creator(TO_NUMBER, FROM_NUMBER, message).create();
+            if (isWhatsApp) {
+                String contentSid = getWhatsAppContentSid(lang);
+                if (contentSid != null && !contentSid.trim().isEmpty()) {
+                    Message.creator(TO_NUMBER, FROM_NUMBER, "")
+                    .setContentSid(contentSid)
+                    .setContentVariables("{\"1\":\"" + otpCode + "\"}")
+                    .create();
+    } else {
+        logger.error("No WhatsApp content SID found for language: {}", lang);
+        return false;
+    }
+    } else {
+    Message.creator(TO_NUMBER, FROM_NUMBER, message).create();
+    }
+
+            logger.info("OTP code has been successfully sent to {}", phone);
+
             return true;
-        } catch (Exception ex) {
-            logger.error("Failed to send OTP to {}. Error: {}", phone, ex.getMessage(), ex);
+        } catch (Exception exception) {
+            logger.error("Error sending OTP code to {}: {}", phone, exception.getMessage(), exception);
             return false;
         }
+    }
+    */
+
+    //HTTP method for using setContentsid methods as the current twilio SDK in janssen doesn't support the newer twilio methods
+//Remove this and uncomment the above once the sdk is updated by Gluu team
+ private boolean sendTwilioSms(String phone, String message, String verificationMethod, String otpCode, String lang) {
+        try {
+            String fromNumber = getFromNumberForPhone(phone);
+
+            if (fromNumber == null || fromNumber.trim().isEmpty()) {
+                logger.error("FROM_NUMBER is null or empty, cannot send OTP to {}", phone);
+                return false;
+            }
+
+            boolean isWhatsApp = "whatsapp".equalsIgnoreCase(verificationMethod);
+
+            if (isWhatsApp) {
+                String whatsappFrom = flowConfig.get("FROM_NUMBER_WHATSAPP");
+                if (whatsappFrom != null && !whatsappFrom.trim().isEmpty()) {
+                    fromNumber = whatsappFrom;
+                }
+                fromNumber = "whatsapp:" + fromNumber;
+                phone = "whatsapp:" + phone;
+                logger.info("Using WhatsApp channel for OTP delivery");
+
+                String contentSid = getWhatsAppContentSid(lang);
+                if (contentSid == null || contentSid.trim().isEmpty()) {
+                    logger.error("No WhatsApp content SID found for language: {}", lang);
+                    return false;
+                }
+
+                String accountSid = flowConfig.get("ACCOUNT_SID");
+                String authToken = flowConfig.get("AUTH_TOKEN");
+                String credentials = Base64.getEncoder().encodeToString(
+                    (accountSid + ":" + authToken).getBytes(java.nio.charset.StandardCharsets.UTF_8)
+                );
+
+                String encodedTo = java.net.URLEncoder.encode(phone, "UTF-8");
+                String encodedFrom = java.net.URLEncoder.encode(fromNumber, "UTF-8");
+                String encodedSid = java.net.URLEncoder.encode(contentSid, "UTF-8");
+                String encodedVars = java.net.URLEncoder.encode("{\"1\":\"" + otpCode + "\"}", "UTF-8");
+                String formBody = "To=" + encodedTo + "&From=" + encodedFrom + "&ContentSid=" + encodedSid + "&ContentVariables=" + encodedVars;
+
+
+                HttpRequest request = HttpRequest.newBuilder()
+                    .uri(URI.create("https://api.twilio.com/2010-04-01/Accounts/" + accountSid + "/Messages.json"))
+                    .header("Authorization", "Basic " + credentials)
+                    .header("Content-Type", "application/x-www-form-urlencoded")
+                    .POST(HttpRequest.BodyPublishers.ofString(formBody))
+                    .build();
+
+                HttpResponse<String> response = HttpClient.newHttpClient()
+                    .send(request, HttpResponse.BodyHandlers.ofString());
+
+                logger.info("Twilio WhatsApp API response: {} {}", response.statusCode(), response.body());
+
+                if (response.statusCode() < 200 || response.statusCode() >= 300) {
+                    logger.error("WhatsApp send failed: {}", response.body());
+                    return false;
+                }
+            } else {
+                PhoneNumber FROM_NUMBER = new PhoneNumber(fromNumber);
+                logger.info("Sending from: {}", fromNumber);
+                PhoneNumber TO_NUMBER = new PhoneNumber(phone);
+                logger.info("Sending to: {}", phone);
+                Twilio.init(flowConfig.get("ACCOUNT_SID"), flowConfig.get("AUTH_TOKEN"));
+                Message.creator(TO_NUMBER, FROM_NUMBER, message).create();
+            }
+
+            logger.info("OTP code has been successfully sent to {}", phone);
+            return true;
+        } catch (Exception exception) {
+            logger.error("Error sending OTP code to {}: {}", phone, exception.getMessage(), exception);
+            return false;
+        }
+    }
+
+
+    private String getWhatsAppContentSid(String lang) {
+        String suffix = (lang != null && !lang.isEmpty()) ? lang.toUpperCase() : "EN";
+        String sid = flowConfig.get("WHATSAPP_CONTENT_SID_" + suffix);
+        if (sid == null || sid.trim().isEmpty()) {
+            logger.info("No WhatsApp SID for language {}, falling back to EN", suffix);
+            sid = flowConfig.get("WHATSAPP_CONTENT_SID_EN");
+        }
+        return sid;
     }
 
     public boolean validateOTPCode(String phone, String code) {
