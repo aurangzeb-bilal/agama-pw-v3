@@ -64,8 +64,16 @@ public class JansNewPasswordService extends NewPasswordService {
 
     @Override
     public boolean validate(String username, String password) {
+        // Phase gate: business accounts must NOT authenticate via the personal login flow.
+        // They have their own dedicated business login flow. Returning false yields the same
+        // surface as invalid credentials — no account-type leak to the caller.
+        if (isBusinessAccount(username)) {
+            logger.warn("Personal login rejected — business account attempted personal login: {}", username);
+            return false;
+        }
         logger.info("Validating user credentials.");
         boolean hasLogin = authenticationService.authenticate(username, password);
+
         if (hasLogin && Boolean.valueOf(flowConfig.get("ENABLE_ACCOUNT_LOCK"))) {
             logger.info("Credentials are valid and user account locked feature is activated");
             User currentUser = userService.getUser(username);
@@ -78,7 +86,17 @@ public class JansNewPasswordService extends NewPasswordService {
 
     @Override
     public String lockAccount(String username) {
+        // Don't touch business accounts via the personal flow. Without this, a business
+        // account failing the validate() gate above would still get its invalid-login count
+        // incremented and eventually be locked (jansStatus -> inactive) here — locking it
+        // out of its own business flow too. Returning null keeps the UI surface identical
+        // to "username doesn't exist" — no information leak.
+        if (isBusinessAccount(username)) {
+            logger.warn("Personal lockAccount skipped — business account: {}", username);
+            return null;
+        }
         User currentUser = userService.getUser(username);
+        
         if (currentUser == null) {
             LogUtils.log("User % not found. Cannot lock account.", username);
             return "User not found. Cannot proceed with account lock.";
