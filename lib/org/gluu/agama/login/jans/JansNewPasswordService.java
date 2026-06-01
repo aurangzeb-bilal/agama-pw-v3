@@ -26,9 +26,6 @@ import java.net.http.HttpResponse;
 import java.net.URI;
 import java.util.Base64;
 
-import com.twilio.Twilio;
-import com.twilio.rest.api.v2010.account.Message;
-import com.twilio.type.PhoneNumber;
 
 public class JansNewPasswordService extends NewPasswordService {
 
@@ -64,8 +61,16 @@ public class JansNewPasswordService extends NewPasswordService {
 
     @Override
     public boolean validate(String username, String password) {
+        // Phase gate: business accounts must NOT authenticate via the personal login flow.
+        // They have their own dedicated business login flow. Returning false yields the same
+        // surface as invalid credentials — no account-type leak to the caller.
+        if (isBusinessAccount(username)) {
+            logger.warn("Personal login rejected — business account attempted personal login: {}", username);
+            return false;
+        }
         logger.info("Validating user credentials.");
         boolean hasLogin = authenticationService.authenticate(username, password);
+
         if (hasLogin && Boolean.valueOf(flowConfig.get("ENABLE_ACCOUNT_LOCK"))) {
             logger.info("Credentials are valid and user account locked feature is activated");
             User currentUser = userService.getUser(username);
@@ -78,7 +83,17 @@ public class JansNewPasswordService extends NewPasswordService {
 
     @Override
     public String lockAccount(String username) {
+        // Don't touch business accounts via the personal flow. Without this, a business
+        // account failing the validate() gate above would still get its invalid-login count
+        // incremented and eventually be locked (jansStatus -> inactive) here — locking it
+        // out of its own business flow too. Returning null keeps the UI surface identical
+        // to "username doesn't exist" — no information leak.
+        if (isBusinessAccount(username)) {
+            logger.warn("Personal lockAccount skipped — business account: {}", username);
+            return null;
+        }
         User currentUser = userService.getUser(username);
+        
         if (currentUser == null) {
             LogUtils.log("User % not found. Cannot lock account.", username);
             return "User not found. Cannot proceed with account lock.";
@@ -118,6 +133,20 @@ public class JansNewPasswordService extends NewPasswordService {
 
         }
         return null;
+    }
+
+        // A user is a "business account" when it carries a non-empty businessName attribute.
+    // Used as the phase gate to keep business accounts out of the personal login flow.
+    private boolean isBusinessAccount(String username) {
+        try {
+            User user = userService.getUser(username);
+            if (user == null) return false;
+            Object orgVal = user.getAttribute("businessName", true, false);
+            return orgVal != null && !orgVal.toString().trim().isEmpty();
+        } catch (Exception e) {
+            logger.error("isBusinessAccount lookup failed for {}: {}", username, e.getMessage(), e);
+            return false;
+        }
     }
 
     private String getCustomAttribute(User user, String attributeName) {
@@ -397,19 +426,42 @@ public class JansNewPasswordService extends NewPasswordService {
                     logger.error("WhatsApp send failed: {}", response.body());
                     return false;
                 }
-            } else {
-                PhoneNumber FROM_NUMBER = new PhoneNumber(fromNumber);
-                logger.info("Sending from: {}", fromNumber);
-                PhoneNumber TO_NUMBER = new PhoneNumber(phone);
-                logger.info("Sending to: {}", phone);
-                Twilio.init(flowConfig.get("ACCOUNT_SID"), flowConfig.get("AUTH_TOKEN"));
-                Message.creator(TO_NUMBER, FROM_NUMBER, message).create();
+                        } else {
+                // SMS via raw HTTP — avoids the Twilio SDK and its Apache HttpClient 5
+                // dependency, which isn't on the Jans classpath (the NoClassDefFoundError source).
+                String accountSid = flowConfig.get("ACCOUNT_SID");
+                String authToken = flowConfig.get("AUTH_TOKEN");
+                String credentials = Base64.getEncoder().encodeToString(
+                    (accountSid + ":" + authToken).getBytes(java.nio.charset.StandardCharsets.UTF_8)
+                );
+
+                String encodedTo = java.net.URLEncoder.encode(phone, "UTF-8");
+                String encodedFrom = java.net.URLEncoder.encode(fromNumber, "UTF-8");
+                String encodedBody = java.net.URLEncoder.encode(message, "UTF-8");
+                String formBody = "To=" + encodedTo + "&From=" + encodedFrom + "&Body=" + encodedBody;
+
+                HttpRequest request = HttpRequest.newBuilder()
+                    .uri(URI.create("https://api.twilio.com/2010-04-01/Accounts/" + accountSid + "/Messages.json"))
+                    .header("Authorization", "Basic " + credentials)
+                    .header("Content-Type", "application/x-www-form-urlencoded")
+                    .POST(HttpRequest.BodyPublishers.ofString(formBody))
+                    .build();
+                HttpResponse<String> response = HttpClient.newHttpClient()
+                    .send(request, HttpResponse.BodyHandlers.ofString());
+
+                logger.info("Twilio SMS API response: {} {}", response.statusCode(), response.body());
+                if (response.statusCode() < 200 || response.statusCode() >= 300) {
+                    logger.error("SMS send failed: {}", response.body());
+                    return false;
+                }
             }
 
             logger.info("OTP code has been successfully sent to {}", phone);
             return true;
-        } catch (Exception exception) {
-            logger.error("Error sending OTP code to {}: {}", phone, exception.getMessage(), exception);
+        } catch (Throwable t) {
+            // Throwable (not just Exception) so a NoClassDefFoundError from any residual SDK
+            // class-loading surfaces as a clean false return instead of crashing the engine.
+            logger.error("Error sending OTP code to {}. class={} message={}", phone, t.getClass().getName(), t.getMessage(), t);
             return false;
         }
     }

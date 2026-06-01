@@ -47,6 +47,14 @@ public class JansNewResetService extends NewResetService{
         LogUtils.log("There is % local account for %", local ? "a" : "no", email);
     
         if (local) {            
+                        // Phase gate: business accounts must NOT reset their password via the personal flow.
+            // They have their own dedicated business reset flow. Returning an empty map gives
+            // the same surface as "no account for this email" — no information leak.
+            if (isBusinessAccount(user)) {
+                LogUtils.log("Personal reset rejected — business account for email %", email);
+                return new HashMap<>();
+            }
+
             String uid = getSingleValuedAttr(user, UID);
             String inum = getSingleValuedAttr(user, INUM_ATTR);
 
