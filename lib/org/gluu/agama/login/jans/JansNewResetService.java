@@ -71,6 +71,19 @@ public class JansNewResetService extends NewResetService{
         return new HashMap<>();
     }    
 
+        // A user is a "business account" when it carries a non-empty businessName attribute.
+    // Used as the phase gate to keep business accounts out of the personal reset flow.
+    private boolean isBusinessAccount(User user) {
+        try {
+            if (user == null) return false;
+            Object orgVal = user.getAttribute("businessName", true, false);
+            return orgVal != null && !orgVal.toString().trim().isEmpty();
+        } catch (Exception e) {
+            LogUtils.log("isBusinessAccount lookup failed: %", e.getMessage());
+            return false;
+        }
+    }
+
     private String getSingleValuedAttr(User user, String attribute) {
         Object value = null;
         if (attribute.equals(UID)) {
