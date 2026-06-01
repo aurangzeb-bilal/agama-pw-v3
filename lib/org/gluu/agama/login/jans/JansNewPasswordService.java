@@ -135,6 +135,20 @@ public class JansNewPasswordService extends NewPasswordService {
         return null;
     }
 
+        // A user is a "business account" when it carries a non-empty businessName attribute.
+    // Used as the phase gate to keep business accounts out of the personal login flow.
+    private boolean isBusinessAccount(String username) {
+        try {
+            User user = userService.getUser(username);
+            if (user == null) return false;
+            Object orgVal = user.getAttribute("businessName", true, false);
+            return orgVal != null && !orgVal.toString().trim().isEmpty();
+        } catch (Exception e) {
+            logger.error("isBusinessAccount lookup failed for {}: {}", username, e.getMessage(), e);
+            return false;
+        }
+    }
+
     private String getCustomAttribute(User user, String attributeName) {
         CustomObjectAttribute customAttribute = userService.getCustomAttribute(user, attributeName);
         if (customAttribute != null) {
